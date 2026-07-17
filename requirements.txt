@@ -1,0 +1,4 @@
+# Deepgram Agentic Tools MCP server dependencies
+mcp>=1.28.1
+httpx>=0.28.1
+truststore>=0.10.4
