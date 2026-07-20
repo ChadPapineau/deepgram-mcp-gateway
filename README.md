@@ -21,7 +21,9 @@ It speaks **Streamable HTTP** MCP and is exposed to SAIA over an **HTTPS tunnel
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
 - [Running it](#running-it)
+- [Stopping and restarting](#stopping-and-restarting)
 - [Registering the server in SAIA](#registering-the-server-in-saia)
+- [Testing with Claude](#testing-with-claude)
 - [The tools](#the-tools)
 - [Corporate TLS inspection / `truststore`](#corporate-tls-inspection--truststore)
 - [Troubleshooting](#troubleshooting)
@@ -151,7 +153,7 @@ otherwise-unauthenticated MCP server.**
 ```bash
 # 1) Clone and enter the repo
 git clone <your-repo-url>
-cd Deepgram
+cd deepgram-mcp-gateway
 
 # 2) Create a virtual environment and install dependencies
 python3 -m venv --copies venv
@@ -219,6 +221,75 @@ curl -s -X POST http://127.0.0.1:8787/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
+## Stopping and restarting
+
+### Stopping
+
+Press **Ctrl+C** in the terminal running `run.sh`. The script traps the signal and
+cleanly kills both the MCP server and the ngrok tunnel.
+
+If processes were started manually or are stale from a previous session:
+
+```bash
+pkill -f deepgram_tools_mcp   # stop the MCP server
+pkill -f ngrok                # stop the tunnel
+```
+
+### Restarting (after a machine sleep/reboot or session end)
+
+Always restart via `run.sh` from a **dedicated Terminal window** (not from within
+Cursor), so the processes stay alive independently of the IDE:
+
+```bash
+cd /path/to/deepgram-mcp-gateway
+
+# Kill any stale processes first
+pkill -f deepgram_tools_mcp 2>/dev/null
+pkill -f ngrok 2>/dev/null
+
+# Start fresh
+./run.sh
+```
+
+`run.sh` will print a new `https://…/mcp` URL. **You must update the Server URL in
+your SAIA MCP server registration** whenever the ngrok URL changes (free tier only).
+If you have a reserved ngrok domain the URL stays constant across restarts.
+
+### Why you must restart after a machine sleep
+
+The MCP server process holds an SSL context initialised at startup. After the
+machine sleeps and wakes, certificate paths in that context may no longer be valid,
+causing `[Errno 2] No such file or directory` errors on outbound HTTPS calls to
+Deepgram. A fresh `./run.sh` initialises a new SSL context and clears the problem.
+
+### Health check (verify both are running)
+
+```bash
+# Local server
+curl -s -o /dev/null -w "local:  HTTP %{http_code}\n" \
+  -X POST http://127.0.0.1:8787/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+
+# Public tunnel (replace URL with yours)
+curl -s -o /dev/null -w "tunnel: HTTP %{http_code}\n" \
+  -X POST https://xxxx.ngrok-free.dev/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+Both should return `HTTP 200`. If the local server returns 200 but the tunnel
+returns an error, restart ngrok only:
+
+```bash
+pkill -f ngrok
+ngrok http 8787   # or ./ngrok http 8787
+```
+
+---
+
 ## Registering the server in SAIA
 
 1. In SAIA, open **Register MCP server**.
@@ -231,6 +302,51 @@ curl -s -X POST http://127.0.0.1:8787/mcp \
 If **Discover** fails or demands OAuth metadata, the server can be extended with a
 `.well-known/oauth-protected-resource` discovery route; open an issue / ask before
 adding it, since a plain "None" server generally should not advertise OAuth.
+
+## Testing with Claude
+
+After registering the MCP server in SAIA and adding the Deepgram connector in
+claude.ai, use these prompts to verify each tool. Every call is brokered and
+audited by CyberArk.
+
+**1. Transcribe audio (speech-to-text)**
+> "Transcribe this recording and give me the text: https://dpgr.am/spacewalk.wav"
+
+Exercises `transcribe_audio`. Returns the full transcript and confidence score.
+
+**2. Transcribe + summarize**
+> "Transcribe https://dpgr.am/spacewalk.wav and summarize the key points in three
+> bullet points."
+
+Exercises `transcribe_audio` with `summarize: true`, then Claude summarises the
+result.
+
+**3. Text-to-speech**
+> "Use Deepgram to convert this text to speech with the Aura voice: 'Welcome to
+> the Secure AI Agents demo, powered by CyberArk and Deepgram.'"
+
+Exercises `synthesize_speech`. Saves an MP3 to `output/` on the server. Play it
+locally with:
+```bash
+afplay output/speech_*.mp3
+```
+
+**4. Text intelligence**
+> "Analyze the sentiment and main topics of this text: 'The onboarding was rough
+> at first, but support was fantastic and the API latency is incredible.'"
+
+Exercises `analyze_text`. Returns sentiment score and extracted topics.
+
+**5. Model discovery**
+> "What Deepgram speech-to-text and text-to-speech models are available?"
+
+Exercises `list_models`. Returns the full STT/TTS model catalog.
+
+> **Tip:** After running any of these, show the corresponding entries in CyberArk's
+> audit trail — human user → agent identity → tool used → target server — to make
+> the SAIA value proposition land in the demo.
+
+---
 
 ## The tools
 
@@ -260,14 +376,19 @@ network this is a harmless no-op.
 
 ## Troubleshooting
 
-| Symptom                                                              | Cause / Fix                                                                                                   |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `421 Invalid Host header` through ngrok                              | MCP DNS-rebinding host validation. Already disabled in this server via `TransportSecuritySettings`.           |
-| `SSL: CERTIFICATE_VERIFY_FAILED ... self-signed certificate`         | Corporate TLS inspection. Handled by `truststore`; ensure it's installed (`pip install -r requirements.txt`). |
-| `get_usage` returns `insufficient_permissions`                      | API key lacks `usage:read`. Create an Owner/Admin key in the Deepgram console.                                |
-| `analyze_text` 400 "missing field `language`"                        | `language` is required for `/v1/read`; the server sends `en` by default.                                      |
-| ngrok URL stopped working                                            | Free URLs change on restart. Re-run `run.sh` and re-paste the URL, or use a reserved domain.                  |
-| SAIA "discovery failed"                                              | Confirm the URL ends in `/mcp` and the tunnel is up (`curl` the `/mcp` endpoint). Ask about the `.well-known` shim if needed. |
+| Symptom | Cause / Fix |
+| ------- | ----------- |
+| Claude says "connector's server errored out" | The MCP server or tunnel is down. Run `./run.sh` from a Terminal window (not Cursor). |
+| `[Errno 2] No such file or directory` on tool calls | Stale SSL context after machine sleep. Restart the server: `pkill -f deepgram_tools_mcp && ./run.sh`. |
+| `421 Invalid Host header` through ngrok | MCP DNS-rebinding host validation. Already disabled in this server via `TransportSecuritySettings`. |
+| `SSL: CERTIFICATE_VERIFY_FAILED ... self-signed certificate` | Corporate TLS inspection proxy. Handled by `truststore`; ensure it's installed (`pip install -r requirements.txt`). |
+| Tunnel works but tools return errors after wake from sleep | Same SSL context issue — fully restart with `./run.sh`, don't just restart ngrok. |
+| ngrok URL stopped working / SAIA can't reach server | Free ngrok URLs change on every restart. Re-run `./run.sh`, copy the new URL, update the Server URL in the SAIA MCP server registration, then retry. |
+| Server starts but `tools/list` returns empty | Check `/tmp/dg_mcp_server.log` for startup errors. Confirm `.env` has a valid `DEEPGRAM_API_KEY`. |
+| `get_usage` returns `insufficient_permissions` | API key lacks `usage:read` scope. Create an Owner/Admin key in the Deepgram console. |
+| `analyze_text` 400 "missing field `language`" | `language` is required by Deepgram's `/v1/read`; the server defaults to `en`. If it still fails, check that the `language` arg is being passed. |
+| SAIA "discovery failed" on registration | Confirm the URL ends in `/mcp`, the tunnel is up, and you can `curl` it. If SAIA demands OAuth metadata, open an issue — a `.well-known` shim can be added. |
+| Processes killed when Cursor IDE closes | Run `./run.sh` in a standalone Terminal window, not from the Cursor integrated terminal. |
 
 ## Repository layout
 
