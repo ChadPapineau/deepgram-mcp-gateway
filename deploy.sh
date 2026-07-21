@@ -455,15 +455,15 @@ fi
 # ── 17. get the public URL ─────────────────────────────────────────────────────
 URL=$(aws ecs describe-express-gateway-service \
   --service-arn "${SERVICE_ARN}" --region "${REGION}" \
-  --query "service.serviceRevisions[0].ingressPaths[?access=='PUBLIC'].endpoint | [0]" \
+  --query "service.activeConfigurations[0].ingressPaths[?accessType=='PUBLIC'].endpoint | [0]" \
   --output text 2>/dev/null || echo "")
 
-# Fallback: construct from service name (predictable pattern)
-if [ -z "${URL}" ] || [ "${URL}" = "None" ]; then
-  URL="https://${SERVICE_NAME}.ecs.${REGION}.on.aws"
-fi
-
 # Ensure https:// prefix
+if [ -z "${URL}" ] || [ "${URL}" = "None" ] || [ "${URL}" = "null" ]; then
+  err "Could not read the service URL. Run the describe command below to find it manually:"
+  err "  aws ecs describe-express-gateway-service --service-arn ${SERVICE_ARN} --region ${REGION} --query \"service.activeConfigurations[0].ingressPaths\" --output json"
+  exit 1
+fi
 [[ "${URL}" == https://* ]] || URL="https://${URL}"
 
 MCP_URL="${URL%/}/mcp"
