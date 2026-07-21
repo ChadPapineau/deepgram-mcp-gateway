@@ -311,8 +311,51 @@ async def get_usage(start: str | None = None, end: str | None = None) -> dict[st
 
 
 async def _health(request: Request) -> JSONResponse:
-    """Simple liveness probe used by AWS App Runner and load balancers."""
+    """Simple liveness probe used by AWS ECS / ALB health checks."""
     return JSONResponse({"status": "ok", "server": "deepgram-mcp-gateway"})
+
+
+async def _oauth_authorization_server(request: Request) -> JSONResponse:
+    """
+    RFC 8414 — OAuth 2.0 Authorization Server Metadata.
+
+    CyberArk SAIA calls this endpoint during 'Discover' to determine the MCP
+    server's authentication method.  Returning empty response_types and
+    grant_types (with no authorization_endpoint) signals that this server has
+    NO OAuth flows — i.e. auth method = None.  SAIA will then allow the user
+    to select / confirm 'None' as the authentication method when registering.
+    """
+    base = str(request.base_url).rstrip("/")
+    return JSONResponse(
+        {
+            "issuer": base,
+            "scopes_supported": [],
+            "response_types_supported": [],
+            "grant_types_supported": [],
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+async def _oauth_protected_resource(request: Request) -> JSONResponse:
+    """
+    RFC 9396 — OAuth 2.0 Protected Resource Metadata.
+
+    'authorization_servers': [] means there are NO OAuth authorization servers
+    protecting this resource — i.e. public / no-auth access is permitted.
+    MCP clients and CyberArk SAIA use this as the definitive signal that
+    auth method = None.
+    """
+    base = str(request.base_url).rstrip("/")
+    return JSONResponse(
+        {
+            "resource": f"{base}/mcp",
+            "authorization_servers": [],
+            "bearer_methods_supported": [],
+            "resource_signing_alg_values_supported": [],
+        },
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
 
 
 def main() -> None:
@@ -338,6 +381,19 @@ def main() -> None:
     app = Starlette(
         routes=[
             Route("/health", endpoint=_health, methods=["GET"]),
+            # OAuth discovery endpoints — SAIA queries these during 'Discover'
+            # to determine authentication requirements.  Empty arrays signal
+            # that no OAuth/auth is needed (auth method = None).
+            Route(
+                "/.well-known/oauth-authorization-server",
+                endpoint=_oauth_authorization_server,
+                methods=["GET"],
+            ),
+            Route(
+                "/.well-known/oauth-protected-resource",
+                endpoint=_oauth_protected_resource,
+                methods=["GET"],
+            ),
             Mount("/", app=mcp_asgi),
         ]
     )
