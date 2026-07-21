@@ -410,8 +410,7 @@ if [ -n "${EXISTING_SERVICE_ARN}" ]; then
     --service-arn "${EXISTING_SERVICE_ARN}" \
     --primary-container "${PRIMARY_CONTAINER}" \
     --execution-role-arn "${EXEC_ROLE_ARN}" \
-    --region "${REGION}" \
-    --no-monitor-resources >/dev/null
+    --region "${REGION}" >/dev/null
   SERVICE_ARN="${EXISTING_SERVICE_ARN}"
   ok "Update triggered."
 else
@@ -422,7 +421,6 @@ else
     --infrastructure-role-arn "${INFRA_ROLE_ARN}" \
     --health-check-path "/health" \
     --region "${REGION}" \
-    --no-monitor-resources \
     --query "service.serviceArn" --output text)
   ok "ECS Express Mode service created: ${SERVICE_ARN}"
 fi
