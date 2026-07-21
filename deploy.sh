@@ -189,6 +189,12 @@ print(json.dumps({
 ")" >/dev/null
 ok "CodeBuild IAM policy attached"
 
+# IAM is eventually consistent — newly created roles take ~15 s to propagate
+# before CodeBuild can assume them. Without this wait, create-project fails
+# with "CodeBuild is not authorized to perform: sts:AssumeRole on service role."
+echo "  Waiting 20 s for IAM role to propagate..."
+sleep 20
+
 # ── 9. CodeBuild project ──────────────────────────────────────────────────────
 step "Creating CodeBuild project"
 CB_PROJECT_NAME="${SERVICE_NAME}-build"
