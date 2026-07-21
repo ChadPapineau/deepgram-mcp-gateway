@@ -35,10 +35,9 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Route
 
 # Trust the OS/system certificate store (macOS keychain, corporate root CAs, etc.)
 # so TLS-inspection proxies don't break outbound HTTPS. Falls back silently if
@@ -374,35 +373,33 @@ def main() -> None:
     mcp.settings.host = args.host
     mcp.settings.port = args.port
 
-    # Wrap the FastMCP ASGI app with a top-level Starlette app so we can add
-    # extra routes (e.g. /health for App Runner / ALB health checks) alongside
-    # the MCP endpoint at /mcp.
-    mcp_asgi = mcp.streamable_http_app()
-    app = Starlette(
-        routes=[
-            Route("/health", endpoint=_health, methods=["GET"]),
-            # OAuth discovery endpoints — SAIA queries these during 'Discover'
-            # to determine authentication requirements.  Empty arrays signal
-            # that no OAuth/auth is needed (auth method = None).
-            Route(
-                "/.well-known/oauth-authorization-server",
-                endpoint=_oauth_authorization_server,
-                methods=["GET"],
-            ),
-            Route(
-                "/.well-known/oauth-protected-resource",
-                endpoint=_oauth_protected_resource,
-                methods=["GET"],
-            ),
-            Mount("/", app=mcp_asgi),
-        ]
-    )
+    # Obtain the FastMCP Starlette app and prepend our custom routes directly
+    # into its router.  This preserves FastMCP's lifespan/startup hooks, which
+    # do NOT fire when its ASGI app is mounted inside a separate Starlette
+    # wrapper — causing the server to accept TCP connections but never
+    # initialise its request handler (ALB health checks time out, curl stalls).
+    mcp_app = mcp.streamable_http_app()
+    mcp_app.router.routes[:0] = [
+        Route("/health", endpoint=_health, methods=["GET"]),
+        # RFC 8414 / RFC 9396 — SAIA queries these during 'Discover' to learn
+        # the authentication requirements.  Empty lists signal auth = None.
+        Route(
+            "/.well-known/oauth-authorization-server",
+            endpoint=_oauth_authorization_server,
+            methods=["GET"],
+        ),
+        Route(
+            "/.well-known/oauth-protected-resource",
+            endpoint=_oauth_protected_resource,
+            methods=["GET"],
+        ),
+    ]
 
     import uvicorn
 
     print(f">> Deepgram Agentic Tools MCP on http://{args.host}:{args.port}/mcp", file=sys.stderr)
-    print(f">> Health check at http://{args.host}:{args.port}/health", file=sys.stderr)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    print(f">> Health check      http://{args.host}:{args.port}/health", file=sys.stderr)
+    uvicorn.run(mcp_app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":
