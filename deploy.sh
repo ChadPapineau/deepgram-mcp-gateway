@@ -410,9 +410,13 @@ if [ -n "${EXISTING_SERVICE_ARN}" ]; then
     --service-arn "${EXISTING_SERVICE_ARN}" \
     --primary-container "${PRIMARY_CONTAINER}" \
     --execution-role-arn "${EXEC_ROLE_ARN}" \
+    --health-check-path "/health" \
     --region "${REGION}" >/dev/null
   SERVICE_ARN="${EXISTING_SERVICE_ARN}"
   ok "Update triggered."
+  # Give ECS time to begin rolling out the new revision before we start polling
+  echo "  Waiting 30 s for rolling update to begin..."
+  sleep 30
 else
   SERVICE_ARN=$(aws ecs create-express-gateway-service \
     --service-name "${SERVICE_NAME}" \
