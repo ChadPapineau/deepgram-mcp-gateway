@@ -10,11 +10,6 @@ venv/
 # Generated TTS audio and other outputs
 output/
 
-# ngrok binary and archives (download per-machine)
-ngrok
-ngrok.zip
-*.ngrok
-
 # Logs
 *.log
 
@@ -30,3 +25,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# AWS — do not commit cached credentials or generated artifacts
+.aws/
+apprunner-service-arn.txt

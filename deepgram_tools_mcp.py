@@ -35,6 +35,10 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
 # Trust the OS/system certificate store (macOS keychain, corporate root CAs, etc.)
 # so TLS-inspection proxies don't break outbound HTTPS. Falls back silently if
@@ -306,6 +310,11 @@ async def get_usage(start: str | None = None, end: str | None = None) -> dict[st
     }
 
 
+async def _health(request: Request) -> JSONResponse:
+    """Simple liveness probe used by AWS App Runner and load balancers."""
+    return JSONResponse({"status": "ok", "server": "deepgram-mcp-gateway"})
+
+
 def main() -> None:
     _load_env()
     parser = argparse.ArgumentParser(description="Deepgram Agentic Tools MCP server")
@@ -321,8 +330,23 @@ def main() -> None:
 
     mcp.settings.host = args.host
     mcp.settings.port = args.port
+
+    # Wrap the FastMCP ASGI app with a top-level Starlette app so we can add
+    # extra routes (e.g. /health for App Runner / ALB health checks) alongside
+    # the MCP endpoint at /mcp.
+    mcp_asgi = mcp.streamable_http_app()
+    app = Starlette(
+        routes=[
+            Route("/health", endpoint=_health, methods=["GET"]),
+            Mount("/", app=mcp_asgi),
+        ]
+    )
+
+    import uvicorn
+
     print(f">> Deepgram Agentic Tools MCP on http://{args.host}:{args.port}/mcp", file=sys.stderr)
-    mcp.run(transport="streamable-http")
+    print(f">> Health check at http://{args.host}:{args.port}/health", file=sys.stderr)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

@@ -6,8 +6,9 @@ listing, and usage — so an AI agent can call them **through CyberArk Secure AI
 Agents (SAIA / Idira)**, with the CyberArk Identity Broker enforcing and auditing
 access.
 
-It speaks **Streamable HTTP** MCP and is exposed to SAIA over an **HTTPS tunnel
-(ngrok)**.
+It speaks **Streamable HTTP** MCP and is deployed to **AWS App Runner** for a
+permanent, stable HTTPS endpoint that is compliant with corporate network security
+policies.
 
 ---
 
@@ -16,12 +17,10 @@ It speaks **Streamable HTTP** MCP and is exposed to SAIA over an **HTTPS tunnel
 - [Why this project exists](#why-this-project-exists)
 - [What it does](#what-it-does)
 - [Architecture](#architecture)
-- [Why ngrok is required](#why-ngrok-is-required)
 - [Authentication model (why "None" in SAIA)](#authentication-model-why-none-in-saia)
 - [Prerequisites](#prerequisites)
-- [Setup](#setup)
-- [Running it](#running-it)
-- [Stopping and restarting](#stopping-and-restarting)
+- [AWS App Runner deployment (recommended)](#aws-app-runner-deployment-recommended)
+- [Local development (optional)](#local-development-optional)
 - [Registering the server in SAIA](#registering-the-server-in-saia)
 - [Testing with Claude](#testing-with-claude)
 - [The tools](#the-tools)
@@ -80,27 +79,27 @@ the agent or the MCP client.
 ```mermaid
 flowchart LR
     subgraph Agent side
-      A["AI Agent"]
+      A["AI Agent\n(e.g. Claude)"]
     end
     subgraph CyberArk
-      B["SAIA / Idira<br/>Identity Broker<br/>(authN + authZ + audit)"]
+      B["SAIA / Idira\nIdentity Broker\n(authN + authZ + audit)"]
     end
-    subgraph Your machine
-      N["ngrok tunnel<br/>https://xxxx.ngrok-free.dev"]
-      S["deepgram_tools_mcp.py<br/>127.0.0.1:8787/mcp<br/>(Streamable HTTP)"]
+    subgraph AWS
+      R["App Runner\nhttps://xxxx.us-east-1.awsapprunner.com/mcp"]
+      SM["Secrets Manager\nDEEPGRAM_API_KEY"]
     end
-    D["Deepgram REST API<br/>api.deepgram.com/v1"]
+    D["Deepgram REST API\napi.deepgram.com/v1"]
 
     A -->|MCP over HTTPS| B
-    B -->|forwards to registered<br/>Server URL| N
-    N -->|localhost| S
-    S -->|Authorization: Token API_KEY| D
+    B -->|forwards to registered Server URL| R
+    R -->|reads secret at startup| SM
+    R -->|Authorization: Token API_KEY| D
 ```
 
-Request flow: the agent talks to CyberArk; CyberArk authenticates/authorizes/audits
-and forwards the MCP call to the registered **Server URL** (the ngrok HTTPS URL);
-ngrok forwards to the local MCP server; the server calls Deepgram's REST API using
-the server-held API key and returns the result back up the chain.
+Request flow: the agent talks to CyberArk; CyberArk authenticates, authorizes, and
+audits the request, then forwards the MCP call to the registered **Server URL** (the
+App Runner HTTPS endpoint); App Runner runs the MCP server which calls Deepgram's
+REST API using the API key injected from Secrets Manager.
 
 ## Why ngrok is required
 
@@ -126,6 +125,7 @@ Notes and alternatives:
 
 ## Authentication model (why "None" in SAIA)
 
+
 SAIA supports two auth methods for a registered MCP server: **OAuth 2.1** or **None**.
 
 - This server intentionally exposes **no OAuth** on the MCP layer. When SAIA runs
@@ -143,76 +143,117 @@ otherwise-unauthenticated MCP server.**
 
 ## Prerequisites
 
-- **Python 3.11+** (developed on 3.14)
 - A **Deepgram API key** — free at <https://console.deepgram.com>
-- An **ngrok account + auth token** — free at <https://dashboard.ngrok.com/signup>
-- The `ngrok` binary (see setup)
+- An **AWS account** with permissions to use App Runner, IAM, and Secrets Manager
+- AWS CLI configured (automatic in CloudShell; or `aws configure` locally)
 
-## Setup
+## AWS App Runner deployment (recommended)
+
+AWS App Runner gives you a **permanent, stable HTTPS URL** with no servers to manage,
+no tunneling tools, and automatic TLS — the correct approach for any environment with
+corporate network security controls.
+
+### Step 1 — One-time: connect App Runner to GitHub
+
+This is done in the AWS Console (browser) and only needs to be done once.
+
+1. Open: **AWS Console → App Runner → GitHub connections**  
+   Direct link: `https://console.aws.amazon.com/apprunner/home#/github-connections`
+2. Click **Add new**, authorise GitHub when prompted, complete the setup
+3. Copy the **Connection ARN** — you will paste it into `deploy.sh`
+
+### Step 2 — Run the deployment script
+
+The script works from **AWS CloudShell** (no local setup needed) or from any
+machine with the AWS CLI configured.
+
+**From AWS CloudShell (recommended):**
 
 ```bash
-# 1) Clone and enter the repo
-git clone <your-repo-url>
+# Open CloudShell from the AWS Console (the terminal icon in the top nav bar)
+git clone https://github.com/ChadPapineau/deepgram-mcp-gateway
 cd deepgram-mcp-gateway
+bash deploy.sh
+```
 
-# 2) Create a virtual environment and install dependencies
+**From a local terminal:**
+
+```bash
+git clone https://github.com/ChadPapineau/deepgram-mcp-gateway
+cd deepgram-mcp-gateway
+bash deploy.sh
+```
+
+The script will prompt for:
+
+| Prompt | What to enter |
+|--------|---------------|
+| AWS Region | e.g. `us-east-1` (or press Enter to use your configured default) |
+| Service name | e.g. `deepgram-mcp-gateway` |
+| GitHub repo URL | `https://github.com/ChadPapineau/deepgram-mcp-gateway` |
+| Branch | `main` |
+| GitHub Connection ARN | Paste the ARN from Step 1 |
+| Deepgram API key | Your key — stored in Secrets Manager, never committed |
+
+When it finishes (~3 minutes) it prints:
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║   Deployment complete!                                        ║
+║                                                               ║
+║  MCP endpoint: https://xxxx.us-east-1.awsapprunner.com/mcp   ║
+║                                                               ║
+║  Steps to register in CyberArk SAIA (Idira):                 ║
+║    1. Open SAIA → Register MCP server                         ║
+║    2. Paste the URL above into 'Server URL'                   ║
+║    3. Click Discover → Auth method should be 'None'           ║
+║    4. Fill in name/category and click Register                ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+### Redeploying after code changes
+
+Auto-deploy is enabled — any `git push origin main` automatically triggers a
+rebuild and redeploy on App Runner. No manual steps required.
+
+### Rotating the Deepgram API key
+
+Re-run `bash deploy.sh` and enter the new key when prompted. The script updates
+Secrets Manager and triggers a fresh deployment.
+
+### Stopping / deleting the service
+
+```bash
+# Find the service ARN
+aws apprunner list-services --region YOUR_REGION \
+  --query "ServiceSummaryList[?ServiceName=='deepgram-mcp-gateway'].ServiceArn" \
+  --output text
+
+# Delete it
+aws apprunner delete-service --service-arn YOUR_SERVICE_ARN --region YOUR_REGION
+```
+
+---
+
+## Local development (optional)
+
+For development and testing only — **not for production or corporate use**.
+
+```bash
+# 1) Clone and install
+git clone https://github.com/ChadPapineau/deepgram-mcp-gateway
+cd deepgram-mcp-gateway
 python3 -m venv --copies venv
-./venv/bin/python -m pip install --upgrade pip
-./venv/bin/python -m pip install -r requirements.txt
+./venv/bin/pip install -r requirements.txt
 
-# 3) Provide your Deepgram API key (kept out of git by .gitignore)
-echo 'DEEPGRAM_API_KEY=your_deepgram_key_here' > .env
+# 2) Add your Deepgram API key
+echo 'DEEPGRAM_API_KEY=your_key_here' > .env
 
-# 4) Install ngrok and register your auth token
-#    macOS (Homebrew):  brew install --cask ngrok
-#    or download from:  https://ngrok.com/download
-ngrok config add-authtoken YOUR_NGROK_TOKEN
-```
-
-> `run.sh` auto-detects `ngrok` from your `PATH`. If needed, override with
-> `NGROK_BIN=/full/path/to/ngrok ./run.sh`.
-
-## Running it
-
-**One command (recommended):**
-
-```bash
-./run.sh
-```
-
-This starts the MCP server and the ngrok tunnel, waits for the public URL, and
-prints the exact **Server URL** to paste into SAIA, e.g.:
-
-```
-============================================================
-  Deepgram MCP is live.
-
-  Paste this into SAIA -> Register MCP server -> Server URL:
-
-      https://xxxx-xxxx-xxxx.ngrok-free.dev/mcp
-
-  Authentication method: None (CyberArk brokers/audits access)
-============================================================
-```
-
-Pin a stable domain (optional):
-
-```bash
-NGROK_DOMAIN=your-name.ngrok.app ./run.sh
-```
-
-**Manual (two terminals):**
-
-```bash
-# terminal 1 — the MCP server
+# 3) Start the server locally
 ./venv/bin/python deepgram_tools_mcp.py --host 127.0.0.1 --port 8787
-
-# terminal 2 — the tunnel
-ngrok http 8787
-# then read the https URL from ngrok's dashboard or http://127.0.0.1:4040
 ```
 
-**Quick local self-test (no SAIA needed):**
+**Quick local self-test:**
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/mcp \
@@ -221,74 +262,18 @@ curl -s -X POST http://127.0.0.1:8787/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 
-## Stopping and restarting
-
-### Stopping
-
-Press **Ctrl+C** in the terminal running `run.sh`. The script traps the signal and
-cleanly kills both the MCP server and the ngrok tunnel.
-
-If processes were started manually or are stale from a previous session:
+**Health check:**
 
 ```bash
-pkill -f deepgram_tools_mcp   # stop the MCP server
-pkill -f ngrok                # stop the tunnel
+curl http://127.0.0.1:8787/health
+# → {"status":"ok","server":"deepgram-mcp-gateway"}
 ```
 
-### Restarting (after a machine sleep/reboot or session end)
-
-Always restart via `run.sh` from a **dedicated Terminal window** (not from within
-Cursor), so the processes stay alive independently of the IDE:
+**Stopping the server:**
 
 ```bash
-cd /path/to/deepgram-mcp-gateway
-
-# Kill any stale processes first
-pkill -f deepgram_tools_mcp 2>/dev/null
-pkill -f ngrok 2>/dev/null
-
-# Start fresh
-./run.sh
+pkill -f deepgram_tools_mcp
 ```
-
-`run.sh` will print a new `https://…/mcp` URL. **You must update the Server URL in
-your SAIA MCP server registration** whenever the ngrok URL changes (free tier only).
-If you have a reserved ngrok domain the URL stays constant across restarts.
-
-### Why you must restart after a machine sleep
-
-The MCP server process holds an SSL context initialised at startup. After the
-machine sleeps and wakes, certificate paths in that context may no longer be valid,
-causing `[Errno 2] No such file or directory` errors on outbound HTTPS calls to
-Deepgram. A fresh `./run.sh` initialises a new SSL context and clears the problem.
-
-### Health check (verify both are running)
-
-```bash
-# Local server
-curl -s -o /dev/null -w "local:  HTTP %{http_code}\n" \
-  -X POST http://127.0.0.1:8787/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-
-# Public tunnel (replace URL with yours)
-curl -s -o /dev/null -w "tunnel: HTTP %{http_code}\n" \
-  -X POST https://xxxx.ngrok-free.dev/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-```
-
-Both should return `HTTP 200`. If the local server returns 200 but the tunnel
-returns an error, restart ngrok only:
-
-```bash
-pkill -f ngrok
-ngrok http 8787   # or ./ngrok http 8787
-```
-
----
 
 ## Registering the server in SAIA
 
@@ -378,43 +363,47 @@ network this is a harmless no-op.
 
 | Symptom | Cause / Fix |
 | ------- | ----------- |
-| Claude says "connector's server errored out" | The MCP server or tunnel is down. Run `./run.sh` from a Terminal window (not Cursor). |
-| `[Errno 2] No such file or directory` on tool calls | Stale SSL context after machine sleep. Restart the server: `pkill -f deepgram_tools_mcp && ./run.sh`. |
-| `421 Invalid Host header` through ngrok | MCP DNS-rebinding host validation. Already disabled in this server via `TransportSecuritySettings`. |
-| `SSL: CERTIFICATE_VERIFY_FAILED ... self-signed certificate` | Corporate TLS inspection proxy. Handled by `truststore`; ensure it's installed (`pip install -r requirements.txt`). |
-| Tunnel works but tools return errors after wake from sleep | Same SSL context issue — fully restart with `./run.sh`, don't just restart ngrok. |
-| ngrok URL stopped working / SAIA can't reach server | Free ngrok URLs change on every restart. Re-run `./run.sh`, copy the new URL, update the Server URL in the SAIA MCP server registration, then retry. |
-| Server starts but `tools/list` returns empty | Check `/tmp/dg_mcp_server.log` for startup errors. Confirm `.env` has a valid `DEEPGRAM_API_KEY`. |
-| `get_usage` returns `insufficient_permissions` | API key lacks `usage:read` scope. Create an Owner/Admin key in the Deepgram console. |
-| `analyze_text` 400 "missing field `language`" | `language` is required by Deepgram's `/v1/read`; the server defaults to `en`. If it still fails, check that the `language` arg is being passed. |
-| SAIA "discovery failed" on registration | Confirm the URL ends in `/mcp`, the tunnel is up, and you can `curl` it. If SAIA demands OAuth metadata, open an issue — a `.well-known` shim can be added. |
-| Processes killed when Cursor IDE closes | Run `./run.sh` in a standalone Terminal window, not from the Cursor integrated terminal. |
+| Claude says "connector's server errored out" | The App Runner service may be paused or deploying. Check its status in the AWS Console → App Runner. |
+| `[Errno 2] No such file or directory` on tool calls (local dev) | Stale SSL context after machine sleep. Restart: `pkill -f deepgram_tools_mcp && ./venv/bin/python deepgram_tools_mcp.py`. |
+| `SSL: CERTIFICATE_VERIFY_FAILED ... self-signed certificate` (local dev) | Corporate TLS inspection proxy. Handled by `truststore`; ensure it's installed (`pip install -r requirements.txt`). |
+| App Runner health check failing | Confirm `/health` returns HTTP 200: `curl https://YOUR_URL/health` |
+| `get_usage` returns `insufficient_permissions` | API key lacks `usage:read` scope. Create an Owner/Admin key in the Deepgram console, then re-run `deploy.sh`. |
+| `analyze_text` 400 "missing field `language`" | `language` is required by Deepgram's `/v1/read`; the server defaults to `en`. |
+| SAIA "discovery failed" on registration | Confirm the URL ends in `/mcp` and `curl https://YOUR_URL/mcp` returns HTTP 200. |
+| `deploy.sh` fails: "connection not found" or similar | The GitHub Connection ARN may be wrong or the connection is not in `AVAILABLE` status. Check App Runner → GitHub connections in the console. |
+| App Runner build fails (Python version) | App Runner uses `PYTHON_3` runtime (Python 3.12). Ensure `requirements.txt` has no version-pinned packages incompatible with 3.12. |
+| `AccessDenied` creating IAM role | Your AWS user/role needs `iam:CreateRole`, `iam:PutRolePolicy`, `iam:GetRole`. Ask your AWS admin to grant these. |
 
 ## Repository layout
 
 ```
 .
-├── deepgram_tools_mcp.py          # The MCP server (5 tools, Streamable HTTP)
-├── run.sh                         # Start server + ngrok, print the SAIA URL
+├── deepgram_tools_mcp.py          # The MCP server (5 tools, Streamable HTTP + /health)
+├── deploy.sh                      # Interactive AWS App Runner deployment script
+├── apprunner.yaml                 # App Runner build/run config (used by deploy.sh)
+├── Dockerfile                     # Container image (alternative/future ECR deployment)
 ├── requirements.txt               # Python dependencies
+├── run.sh                         # Local development launcher (not for production)
 ├── list_deepgram_mcp_tools.py     # Diagnostic: proves kapa endpoint is docs-only
 ├── register-deepgram-oauth-client.sh  # (Optional) DCR helper for Deepgram's OAuth docs endpoint
 ├── README.md
 ├── .gitignore
-├── .env                           # NOT committed — holds DEEPGRAM_API_KEY
-├── venv/                          # NOT committed
-└── output/                        # NOT committed — generated TTS audio
+├── .env.example                   # Template — copy to .env for local dev
+├── .env                           # NOT committed — holds DEEPGRAM_API_KEY (local dev only)
+├── venv/                          # NOT committed — local Python venv
+└── output/                        # NOT committed — generated TTS audio (local dev)
 ```
 
 ## Security notes
 
 - **Never commit `.env`** (it holds your Deepgram API key). It is git-ignored.
+- In the AWS deployment, the API key is stored in **Secrets Manager** — not in the
+  repo, not in App Runner environment config in plain text, and not in any log.
 - The API key stays server-side; it is never sent to the agent or MCP client.
-- ngrok exposes your local server to the public internet while running. The URL is
-  unguessable but unauthenticated at the tunnel layer — in the SAIA demo, access
-  control is enforced by CyberArk. Stop the tunnel (`Ctrl+C`) when not demoing, and
-  don't leave it running unattended.
-- If a key is ever exposed, rotate it in the Deepgram console.
+- The App Runner HTTPS URL is unauthenticated at the MCP layer — access control is
+  enforced by CyberArk SAIA. Share the URL only through the SAIA registration; do
+  not paste it in public channels.
+- If a key is ever exposed, rotate it in the Deepgram console and re-run `deploy.sh`.
 
 ## Appendix: the Deepgram "docs MCP" red herring
 
