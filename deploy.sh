@@ -1,125 +1,107 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy.sh — Deploy Deepgram MCP Gateway to AWS App Runner
+# deploy.sh — Deploy Deepgram MCP Gateway to Amazon ECS Express Mode
 #
 # Works from AWS CloudShell or any machine with the AWS CLI configured.
-# No Docker required — App Runner builds directly from your GitHub repo.
+# No local Docker required — AWS CodeBuild builds the image in the cloud.
 #
 # What this script does:
-#   1. Prompts for all required configuration (region, service name, API key…)
-#   2. Stores the Deepgram API key in AWS Secrets Manager
-#   3. Creates an IAM role so App Runner can read the secret at runtime
-#   4. Creates (or updates) an App Runner service linked to your GitHub repo
-#   5. Waits for the deployment to complete
-#   6. Prints the HTTPS URL to paste into CyberArk SAIA
+#   1. Prompts for all required configuration
+#   2. Creates an Amazon ECR repository for the container image
+#   3. Creates an AWS CodeBuild project that builds the Docker image from GitHub
+#      and pushes it to ECR (no local Docker needed)
+#   4. Runs the CodeBuild build and waits for it to complete
+#   5. Stores the Deepgram API key in AWS Secrets Manager
+#   6. Creates the two IAM roles required by ECS Express Mode
+#   7. Deploys the service with Amazon ECS Express Mode (auto-provisions an
+#      Application Load Balancer, HTTPS cert, autoscaling, and a stable URL)
+#   8. Waits for the service to reach ACTIVE status
+#   9. Prints the HTTPS endpoint to register in CyberArk SAIA
 #
-# Prerequisites (one-time, before running this script):
-#   a) Connect App Runner to GitHub in the AWS Console:
-#      https://console.aws.amazon.com/apprunner/home#/github-connections
-#      → "Add new" → authorise GitHub → copy the Connection ARN
-#   b) AWS CLI configured (in CloudShell this is automatic)
+# Prerequisites (all available in AWS CloudShell by default):
+#   - AWS CLI  (pre-installed in CloudShell)
+#   - Python 3 (pre-installed in CloudShell, used to generate JSON payloads)
 #
 # Usage:
+#   # From AWS CloudShell:
+#   git clone https://github.com/ChadPapineau/deepgram-mcp-gateway
+#   cd deepgram-mcp-gateway
 #   bash deploy.sh
 #
-# Re-running this script on an existing service updates the configuration
-# (e.g. rotates the API key) and triggers a fresh deployment.
+# Re-running this script on an existing deployment updates configuration
+# (e.g. rotates the Deepgram API key) and triggers a fresh image build + deploy.
 # =============================================================================
 
 set -euo pipefail
 
-# ── colour helpers ────────────────────────────────────────────────────────────
+# ── colour helpers ─────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
-step()  { echo -e "\n${GREEN}▶ $*${NC}"; }
+step()  { echo -e "\n${GREEN}▶  $*${NC}"; }
 warn()  { echo -e "${YELLOW}⚠  $*${NC}"; }
 err()   { echo -e "${RED}✖  $*${NC}" >&2; }
 info()  { echo -e "${CYAN}   $*${NC}"; }
 ok()    { echo -e "${GREEN}✔  $*${NC}"; }
 
-# ── prerequisite check ────────────────────────────────────────────────────────
+# ── prerequisites ──────────────────────────────────────────────────────────────
 if ! command -v aws >/dev/null 2>&1; then
   err "AWS CLI not found."
   err "In CloudShell it is pre-installed. Locally: https://aws.amazon.com/cli/"
   exit 1
 fi
+if ! command -v python3 >/dev/null 2>&1; then
+  err "python3 not found (needed to generate JSON payloads)."
+  exit 1
+fi
 
 echo
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║   Deepgram MCP Gateway — AWS App Runner Deployment           ║"
+echo "║   Deepgram MCP Gateway — ECS Express Mode Deployment         ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo
-echo "This script will deploy the Deepgram MCP server to AWS App Runner"
-echo "and print a permanent HTTPS URL to register in CyberArk SAIA."
+echo "  This script deploys the Deepgram MCP server to Amazon ECS"
+echo "  Express Mode and prints a permanent HTTPS URL to register"
+echo "  in CyberArk SAIA / Idira."
 echo
-echo "You will be prompted for the following:"
-echo "  • AWS region"
-echo "  • App Runner service name"
-echo "  • GitHub repo URL and branch"
-echo "  • GitHub Connection ARN  (from the App Runner console)"
-echo "  • Deepgram API key       (stored securely in Secrets Manager)"
+echo "  Required inputs:"
+echo "    • AWS region"
+echo "    • Service / resource name prefix"
+echo "    • GitHub repo URL and branch"
+echo "    • Deepgram API key  (stored in Secrets Manager)"
 echo
-read -rp "Press Enter to continue (Ctrl+C to cancel)..."
+read -rp "Press Enter to continue (Ctrl+C to cancel) ..."
 
 # ── 1. region ─────────────────────────────────────────────────────────────────
 step "AWS Region"
 DETECTED_REGION=$(aws configure get region 2>/dev/null || echo "us-east-1")
 read -rp "  Region [${DETECTED_REGION}]: " REGION
 REGION="${REGION:-${DETECTED_REGION}}"
-info "Using region: ${REGION}"
+info "Region: ${REGION}"
 
 # ── 2. account ID ─────────────────────────────────────────────────────────────
 step "Detecting AWS account"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "${REGION}")
 CALLER=$(aws sts get-caller-identity --query Arn --output text --region "${REGION}")
-info "Account ID : ${ACCOUNT_ID}"
-info "Identity   : ${CALLER}"
+info "Account : ${ACCOUNT_ID}"
+info "Identity: ${CALLER}"
 
 # ── 3. service name ───────────────────────────────────────────────────────────
-step "App Runner service name"
-read -rp "  Service name [deepgram-mcp-gateway]: " SERVICE_NAME
+step "Service name"
+read -rp "  Name prefix for all resources [deepgram-mcp-gateway]: " SERVICE_NAME
 SERVICE_NAME="${SERVICE_NAME:-deepgram-mcp-gateway}"
 info "Service name: ${SERVICE_NAME}"
 
-# ── 4. github repo + branch ───────────────────────────────────────────────────
+# ── 4. GitHub repo ────────────────────────────────────────────────────────────
 step "GitHub repository"
 read -rp "  Repo URL [https://github.com/ChadPapineau/deepgram-mcp-gateway]: " REPO_URL
 REPO_URL="${REPO_URL:-https://github.com/ChadPapineau/deepgram-mcp-gateway}"
 read -rp "  Branch [main]: " BRANCH
 BRANCH="${BRANCH:-main}"
-info "Repository : ${REPO_URL}"
-info "Branch     : ${BRANCH}"
+info "Repo  : ${REPO_URL}"
+info "Branch: ${BRANCH}"
 
-# ── 5. github connection ARN ──────────────────────────────────────────────────
-step "GitHub Connection ARN"
-echo
-echo "  App Runner needs a GitHub connection to pull your repository."
-echo "  If you have not created one yet:"
-echo "    1. Open the link below in your browser:"
-info "   https://console.aws.amazon.com/apprunner/home?region=${REGION}#/github-connections"
-echo "    2. Click 'Add new', authorise GitHub, complete the setup"
-echo "    3. Copy the Connection ARN and paste it below"
-echo
-# List any existing available connections
-CONNECTIONS=$(aws apprunner list-connections --region "${REGION}" \
-  --query 'ConnectionSummaryList[?Status==`AVAILABLE`].[ConnectionArn,ConnectionName]' \
-  --output text 2>/dev/null || true)
-if [ -n "${CONNECTIONS}" ]; then
-  echo "  Existing available connections:"
-  while IFS=$'\t' read -r arn name; do
-    info "  ${name}  →  ${arn}"
-  done <<< "${CONNECTIONS}"
-  echo
-fi
-read -rp "  GitHub Connection ARN: " GITHUB_CONNECTION_ARN
-if [ -z "${GITHUB_CONNECTION_ARN}" ]; then
-  err "GitHub Connection ARN is required. Create one in the App Runner console first."
-  exit 1
-fi
-
-# ── 6. deepgram API key ───────────────────────────────────────────────────────
+# ── 5. Deepgram API key ───────────────────────────────────────────────────────
 step "Deepgram API key"
-echo "  This is stored in AWS Secrets Manager and injected at runtime."
-echo "  It is never stored in the repo or visible in App Runner logs."
+echo "  Stored in AWS Secrets Manager — never committed to the repo."
 echo
 read -rsp "  Deepgram API key (hidden): " DEEPGRAM_API_KEY
 echo
@@ -128,21 +110,170 @@ if [ -z "${DEEPGRAM_API_KEY}" ]; then
   exit 1
 fi
 
-# ── 7. confirm before proceeding ─────────────────────────────────────────────
+# ── 6. confirm ────────────────────────────────────────────────────────────────
+ECR_REPO_NAME="${SERVICE_NAME}"
+ECR_REPO_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}"
 echo
 echo "─────────────────────────────────────────────────────────────────"
-echo "  Ready to deploy with these settings:"
 info "  Region      : ${REGION}"
 info "  Account     : ${ACCOUNT_ID}"
 info "  Service     : ${SERVICE_NAME}"
-info "  Repo        : ${REPO_URL} (branch: ${BRANCH})"
-info "  Connection  : ${GITHUB_CONNECTION_ARN}"
+info "  Repo        : ${REPO_URL} (${BRANCH})"
+info "  ECR image   : ${ECR_REPO_URI}:latest"
 echo "─────────────────────────────────────────────────────────────────"
 echo
 read -rp "Proceed? [y/N]: " CONFIRM
 [[ "${CONFIRM}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 
-# ── 8. store API key in Secrets Manager ──────────────────────────────────────
+# ── 7. ECR repository ──────────────────────────────────────────────────────────
+step "Creating ECR repository"
+if aws ecr describe-repositories --repository-names "${ECR_REPO_NAME}" \
+    --region "${REGION}" >/dev/null 2>&1; then
+  ok "ECR repository already exists: ${ECR_REPO_NAME}"
+else
+  aws ecr create-repository \
+    --repository-name "${ECR_REPO_NAME}" \
+    --region "${REGION}" \
+    --image-scanning-configuration scanOnPush=true >/dev/null
+  ok "ECR repository created: ${ECR_REPO_NAME}"
+fi
+
+# ── 8. CodeBuild service role ─────────────────────────────────────────────────
+step "Creating CodeBuild service role"
+CB_ROLE_NAME="${SERVICE_NAME}-codebuild-role"
+CB_TRUST='{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]
+}'
+if ! aws iam get-role --role-name "${CB_ROLE_NAME}" >/dev/null 2>&1; then
+  aws iam create-role --role-name "${CB_ROLE_NAME}" \
+    --assume-role-policy-document "${CB_TRUST}" \
+    --description "CodeBuild role for ${SERVICE_NAME} image builds" >/dev/null
+  ok "CodeBuild role created: ${CB_ROLE_NAME}"
+else
+  ok "CodeBuild role already exists: ${CB_ROLE_NAME}"
+fi
+CB_ROLE_ARN=$(aws iam get-role --role-name "${CB_ROLE_NAME}" --query Role.Arn --output text)
+
+aws iam put-role-policy \
+  --role-name "${CB_ROLE_NAME}" \
+  --policy-name "BuildAndPushToECR" \
+  --policy-document "$(python3 -c "
+import json, sys
+print(json.dumps({
+  'Version': '2012-10-17',
+  'Statement': [
+    {
+      'Effect': 'Allow',
+      'Action': [
+        'logs:CreateLogGroup','logs:CreateLogStream','logs:PutLogEvents'
+      ],
+      'Resource': '*'
+    },
+    {
+      'Effect': 'Allow',
+      'Action': ['ecr:GetAuthorizationToken'],
+      'Resource': '*'
+    },
+    {
+      'Effect': 'Allow',
+      'Action': [
+        'ecr:BatchCheckLayerAvailability','ecr:GetDownloadUrlForLayer',
+        'ecr:BatchGetImage','ecr:PutImage','ecr:InitiateLayerUpload',
+        'ecr:UploadLayerPart','ecr:CompleteLayerUpload'
+      ],
+      'Resource': 'arn:aws:ecr:${REGION}:${ACCOUNT_ID}:repository/${ECR_REPO_NAME}'
+    }
+  ]
+}))
+")" >/dev/null
+ok "CodeBuild IAM policy attached"
+
+# ── 9. CodeBuild project ──────────────────────────────────────────────────────
+step "Creating CodeBuild project"
+CB_PROJECT_NAME="${SERVICE_NAME}-build"
+CB_PROJECT_JSON=$(python3 - <<PYEOF
+import json
+print(json.dumps({
+  "name": "${CB_PROJECT_NAME}",
+  "description": "Builds Docker image for ${SERVICE_NAME} MCP server",
+  "source": {
+    "type": "GITHUB",
+    "location": "${REPO_URL}",
+    "buildspec": "buildspec.yml"
+  },
+  "sourceVersion": "${BRANCH}",
+  "artifacts": {"type": "NO_ARTIFACTS"},
+  "environment": {
+    "type": "LINUX_CONTAINER",
+    "image": "aws/codebuild/standard:7.0",
+    "computeType": "BUILD_GENERAL1_SMALL",
+    "privilegedMode": True,
+    "environmentVariables": [
+      {"name": "ECR_REPO_URI", "value": "${ECR_REPO_URI}", "type": "PLAINTEXT"},
+      {"name": "AWS_DEFAULT_REGION", "value": "${REGION}", "type": "PLAINTEXT"}
+    ]
+  },
+  "serviceRole": "${CB_ROLE_ARN}",
+  "logsConfig": {
+    "cloudWatchLogs": {
+      "status": "ENABLED",
+      "groupName": "/aws/codebuild/${CB_PROJECT_NAME}"
+    }
+  }
+}))
+PYEOF
+)
+
+if aws codebuild batch-get-projects --names "${CB_PROJECT_NAME}" \
+    --region "${REGION}" --query "projects[0].name" --output text 2>/dev/null \
+    | grep -q "${CB_PROJECT_NAME}"; then
+  aws codebuild update-project --cli-input-json "${CB_PROJECT_JSON}" \
+    --region "${REGION}" >/dev/null
+  ok "CodeBuild project updated: ${CB_PROJECT_NAME}"
+else
+  aws codebuild create-project --cli-input-json "${CB_PROJECT_JSON}" \
+    --region "${REGION}" >/dev/null
+  ok "CodeBuild project created: ${CB_PROJECT_NAME}"
+fi
+
+# ── 10. run CodeBuild to build & push Docker image ────────────────────────────
+step "Building Docker image (this takes ~3 minutes)"
+echo "  CodeBuild pulls from GitHub, runs docker build, and pushes to ECR."
+echo "  No local Docker needed."
+echo
+BUILD_ID=$(aws codebuild start-build \
+  --project-name "${CB_PROJECT_NAME}" \
+  --region "${REGION}" \
+  --query "build.id" --output text)
+ok "Build started: ${BUILD_ID}"
+
+BUILD_URL="https://console.aws.amazon.com/codesuite/codebuild/${ACCOUNT_ID}/projects/${CB_PROJECT_NAME}/build/${BUILD_ID//:/}/view/new"
+info "Live logs: ${BUILD_URL}"
+
+# Poll until build finishes
+ATTEMPTS=40  # 40 × 15s = 10 minutes max
+for i in $(seq 1 ${ATTEMPTS}); do
+  BUILD_STATUS=$(aws codebuild batch-get-builds --ids "${BUILD_ID}" \
+    --region "${REGION}" \
+    --query "builds[0].buildStatus" --output text)
+  printf "  [%2d/%d] Build status: %s\n" "${i}" "${ATTEMPTS}" "${BUILD_STATUS}"
+  case "${BUILD_STATUS}" in
+    SUCCEEDED) ok "Docker image built and pushed to ECR!"; break ;;
+    FAILED|FAULT|STOPPED|TIMED_OUT)
+      err "Build failed (${BUILD_STATUS})."
+      err "Check logs: ${BUILD_URL}"
+      exit 1 ;;
+  esac
+  sleep 15
+done
+
+if [ "${BUILD_STATUS}" != "SUCCEEDED" ]; then
+  err "Build timed out. Check the CodeBuild console for logs."
+  exit 1
+fi
+
+# ── 11. Secrets Manager ───────────────────────────────────────────────────────
 step "Storing Deepgram API key in Secrets Manager"
 SECRET_NAME="${SERVICE_NAME}/deepgram-api-key"
 if aws secretsmanager describe-secret --secret-id "${SECRET_NAME}" \
@@ -151,233 +282,202 @@ if aws secretsmanager describe-secret --secret-id "${SECRET_NAME}" \
     --secret-id "${SECRET_NAME}" \
     --secret-string "${DEEPGRAM_API_KEY}" \
     --region "${REGION}" >/dev/null
-  ok "Updated existing secret: ${SECRET_NAME}"
+  ok "Secret updated: ${SECRET_NAME}"
 else
   aws secretsmanager create-secret \
     --name "${SECRET_NAME}" \
     --description "Deepgram API key for ${SERVICE_NAME} MCP server" \
     --secret-string "${DEEPGRAM_API_KEY}" \
     --region "${REGION}" >/dev/null
-  ok "Created secret: ${SECRET_NAME}"
+  ok "Secret created: ${SECRET_NAME}"
 fi
 SECRET_ARN=$(aws secretsmanager describe-secret \
   --secret-id "${SECRET_NAME}" --region "${REGION}" \
   --query ARN --output text)
 info "Secret ARN: ${SECRET_ARN}"
 
-# ── 9. create IAM instance role ───────────────────────────────────────────────
-step "Creating IAM instance role"
-ROLE_NAME="${SERVICE_NAME}-instance-role"
-TRUST_POLICY='{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": { "Service": "tasks.apprunner.amazonaws.com" },
-    "Action": "sts:AssumeRole"
-  }]
+# ── 12. ECS task execution role ───────────────────────────────────────────────
+step "Creating ECS task execution role"
+EXEC_ROLE_NAME="${SERVICE_NAME}-ecs-exec-role"
+EXEC_TRUST='{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]
 }'
-
-if ! aws iam get-role --role-name "${ROLE_NAME}" >/dev/null 2>&1; then
-  aws iam create-role \
-    --role-name "${ROLE_NAME}" \
-    --assume-role-policy-document "${TRUST_POLICY}" \
-    --description "App Runner instance role for ${SERVICE_NAME}" >/dev/null
-  ok "Role created: ${ROLE_NAME}"
+if ! aws iam get-role --role-name "${EXEC_ROLE_NAME}" >/dev/null 2>&1; then
+  aws iam create-role --role-name "${EXEC_ROLE_NAME}" \
+    --assume-role-policy-document "${EXEC_TRUST}" \
+    --description "ECS task execution role for ${SERVICE_NAME}" >/dev/null
+  ok "Execution role created: ${EXEC_ROLE_NAME}"
 else
-  ok "Role already exists: ${ROLE_NAME}"
+  ok "Execution role already exists: ${EXEC_ROLE_NAME}"
 fi
-
-ROLE_ARN=$(aws iam get-role --role-name "${ROLE_NAME}" \
+EXEC_ROLE_ARN=$(aws iam get-role --role-name "${EXEC_ROLE_NAME}" \
   --query Role.Arn --output text)
 
-aws iam put-role-policy \
-  --role-name "${ROLE_NAME}" \
-  --policy-name "ReadDeepgramSecret" \
-  --policy-document "{
-    \"Version\": \"2012-10-17\",
-    \"Statement\": [{
-      \"Effect\": \"Allow\",
-      \"Action\": [\"secretsmanager:GetSecretValue\"],
-      \"Resource\": \"${SECRET_ARN}\"
-    }]
-  }" >/dev/null
-ok "IAM policy attached (secretsmanager:GetSecretValue)"
-info "Role ARN: ${ROLE_ARN}"
+aws iam attach-role-policy \
+  --role-name "${EXEC_ROLE_NAME}" \
+  --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" \
+  2>/dev/null || true
 
-# ── 10. build service configuration JSON ──────────────────────────────────────
-SERVICE_CONFIG=$(python3 - <<PYEOF
+aws iam put-role-policy \
+  --role-name "${EXEC_ROLE_NAME}" \
+  --policy-name "ReadDeepgramSecret" \
+  --policy-document "$(python3 -c "
 import json
-cfg = {
-  "ServiceName": "${SERVICE_NAME}",
-  "SourceConfiguration": {
-    "CodeRepository": {
-      "RepositoryUrl": "${REPO_URL}",
-      "SourceCodeVersion": {
-        "Type": "BRANCH",
-        "Value": "${BRANCH}"
-      },
-      "CodeConfiguration": {
-        "ConfigurationSource": "API",
-        "CodeConfigurationValues": {
-          "Runtime": "PYTHON_3",
-          "BuildCommand": "pip install -r requirements.txt",
-          "StartCommand": "python deepgram_tools_mcp.py --host 0.0.0.0 --port 8080",
-          "Port": "8080",
-          "RuntimeEnvironmentVariables": {
-            "MCP_HOST": "0.0.0.0",
-            "MCP_PORT":  "8080",
-            "PYTHONUNBUFFERED": "1"
-          },
-          "RuntimeEnvironmentSecrets": {
-            "DEEPGRAM_API_KEY": "${SECRET_ARN}"
-          }
-        }
-      }
-    },
-    "AuthenticationConfiguration": {
-      "ConnectionArn": "${GITHUB_CONNECTION_ARN}"
-    },
-    "AutoDeploymentsEnabled": True
-  },
-  "InstanceConfiguration": {
-    "Cpu":             "0.25 vCPU",
-    "Memory":          "0.5 GB",
-    "InstanceRoleArn": "${ROLE_ARN}"
-  },
-  "HealthCheckConfiguration": {
-    "Protocol":           "HTTP",
-    "Path":               "/health",
-    "Interval":           20,
-    "Timeout":            5,
-    "HealthyThreshold":   1,
-    "UnhealthyThreshold": 5
-  },
-  "Tags": [
-    {"Key": "project",    "Value": "deepgram-mcp-gateway"},
-    {"Key": "managed-by", "Value": "deploy.sh"}
+print(json.dumps({
+  'Version':'2012-10-17',
+  'Statement':[{
+    'Effect':'Allow',
+    'Action':['secretsmanager:GetSecretValue'],
+    'Resource':'${SECRET_ARN}'
+  }]
+}))
+")" >/dev/null
+ok "IAM policy attached (secretsmanager:GetSecretValue)"
+info "Execution role ARN: ${EXEC_ROLE_ARN}"
+
+# ── 13. ECS infrastructure role ───────────────────────────────────────────────
+step "Creating ECS infrastructure role (for Express Mode)"
+INFRA_ROLE_NAME="${SERVICE_NAME}-ecs-infra-role"
+INFRA_TRUST='{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Sid":"AllowAccessInfrastructureForECSExpressServices",
+    "Effect":"Allow",
+    "Principal":{"Service":"ecs.amazonaws.com"},
+    "Action":"sts:AssumeRole"
+  }]
+}'
+if ! aws iam get-role --role-name "${INFRA_ROLE_NAME}" >/dev/null 2>&1; then
+  aws iam create-role --role-name "${INFRA_ROLE_NAME}" \
+    --assume-role-policy-document "${INFRA_TRUST}" \
+    --description "ECS infrastructure role for ${SERVICE_NAME} Express Mode" >/dev/null
+  ok "Infrastructure role created: ${INFRA_ROLE_NAME}"
+else
+  ok "Infrastructure role already exists: ${INFRA_ROLE_NAME}"
+fi
+INFRA_ROLE_ARN=$(aws iam get-role --role-name "${INFRA_ROLE_NAME}" \
+  --query Role.Arn --output text)
+
+aws iam attach-role-policy \
+  --role-name "${INFRA_ROLE_NAME}" \
+  --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRoleforExpressGatewayServices" \
+  2>/dev/null || true
+
+info "Infrastructure role ARN: ${INFRA_ROLE_ARN}"
+
+# IAM roles are eventually consistent; give them a moment to propagate
+echo "  Waiting 15 s for IAM roles to propagate..."
+sleep 15
+
+# ── 14. build --primary-container JSON ────────────────────────────────────────
+PRIMARY_CONTAINER=$(python3 - <<PYEOF
+import json
+print(json.dumps({
+  "image": "${ECR_REPO_URI}:latest",
+  "containerPort": 8080,
+  "environment": [
+    {"name": "MCP_HOST",         "value": "0.0.0.0"},
+    {"name": "MCP_PORT",         "value": "8080"},
+    {"name": "PYTHONUNBUFFERED", "value": "1"}
+  ],
+  "secrets": [
+    {"name": "DEEPGRAM_API_KEY", "valueFrom": "${SECRET_ARN}"}
   ]
-}
-print(json.dumps(cfg))
+}))
 PYEOF
 )
 
-# ── 11. create or update App Runner service ───────────────────────────────────
-step "Deploying App Runner service"
+# ── 15. deploy ECS Express Mode service ───────────────────────────────────────
+step "Deploying ECS Express Mode service"
+echo "  ECS Express Mode auto-provisions an ALB, HTTPS cert, and stable URL."
 
-EXISTING_ARN=$(aws apprunner list-services --region "${REGION}" \
-  --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn" \
-  --output text 2>/dev/null || true)
+# Check if service already exists
+EXISTING_SERVICE_ARN=$(aws ecs list-services \
+  --cluster default --region "${REGION}" \
+  --query "serviceArns[?contains(@, '${SERVICE_NAME}')]" \
+  --output text 2>/dev/null | head -1 || true)
 
-if [ -n "${EXISTING_ARN}" ]; then
-  warn "Service already exists — updating configuration and redeploying…"
-
-  # Build update payload (subset of create payload)
-  UPDATE_CONFIG=$(python3 - <<PYEOF
-import json
-cfg = {
-  "ServiceArn": "${EXISTING_ARN}",
-  "SourceConfiguration": {
-    "CodeRepository": {
-      "RepositoryUrl": "${REPO_URL}",
-      "SourceCodeVersion": { "Type": "BRANCH", "Value": "${BRANCH}" },
-      "CodeConfiguration": {
-        "ConfigurationSource": "API",
-        "CodeConfigurationValues": {
-          "Runtime": "PYTHON_3",
-          "BuildCommand": "pip install -r requirements.txt",
-          "StartCommand": "python deepgram_tools_mcp.py --host 0.0.0.0 --port 8080",
-          "Port": "8080",
-          "RuntimeEnvironmentVariables": {
-            "MCP_HOST": "0.0.0.0",
-            "MCP_PORT":  "8080",
-            "PYTHONUNBUFFERED": "1"
-          },
-          "RuntimeEnvironmentSecrets": {
-            "DEEPGRAM_API_KEY": "${SECRET_ARN}"
-          }
-        }
-      }
-    },
-    "AuthenticationConfiguration": { "ConnectionArn": "${GITHUB_CONNECTION_ARN}" },
-    "AutoDeploymentsEnabled": True
-  },
-  "InstanceConfiguration": {
-    "Cpu":             "0.25 vCPU",
-    "Memory":          "0.5 GB",
-    "InstanceRoleArn": "${ROLE_ARN}"
-  },
-  "HealthCheckConfiguration": {
-    "Protocol": "HTTP", "Path": "/health",
-    "Interval": 20, "Timeout": 5,
-    "HealthyThreshold": 1, "UnhealthyThreshold": 5
-  }
-}
-print(json.dumps(cfg))
-PYEOF
-  )
-
-  aws apprunner update-service \
+if [ -n "${EXISTING_SERVICE_ARN}" ]; then
+  warn "Service '${SERVICE_NAME}' already exists — updating with new image..."
+  aws ecs update-express-gateway-service \
+    --service-arn "${EXISTING_SERVICE_ARN}" \
+    --primary-container "${PRIMARY_CONTAINER}" \
+    --execution-role-arn "${EXEC_ROLE_ARN}" \
     --region "${REGION}" \
-    --cli-input-json "${UPDATE_CONFIG}" >/dev/null
-  SERVICE_ARN="${EXISTING_ARN}"
-  ok "Update triggered for: ${SERVICE_ARN}"
+    --no-monitor-resources >/dev/null
+  SERVICE_ARN="${EXISTING_SERVICE_ARN}"
+  ok "Update triggered."
 else
-  SERVICE_ARN=$(aws apprunner create-service \
+  SERVICE_ARN=$(aws ecs create-express-gateway-service \
+    --service-name "${SERVICE_NAME}" \
+    --primary-container "${PRIMARY_CONTAINER}" \
+    --execution-role-arn "${EXEC_ROLE_ARN}" \
+    --infrastructure-role-arn "${INFRA_ROLE_ARN}" \
+    --health-check-path "/health" \
     --region "${REGION}" \
-    --cli-input-json "${SERVICE_CONFIG}" \
-    --query Service.ServiceArn --output text)
-  ok "Service created: ${SERVICE_ARN}"
+    --no-monitor-resources \
+    --query "service.serviceArn" --output text)
+  ok "ECS Express Mode service created: ${SERVICE_ARN}"
 fi
 
-# ── 12. wait for deployment ───────────────────────────────────────────────────
-step "Waiting for deployment (typically 2–4 minutes)"
+# ── 16. wait for ACTIVE ────────────────────────────────────────────────────────
+step "Waiting for service to become ACTIVE (typically 3–5 minutes)"
 ATTEMPTS=36   # 36 × 10s = 6 minutes max
+STATUS=""
 for i in $(seq 1 ${ATTEMPTS}); do
-  STATUS=$(aws apprunner describe-service \
+  STATUS=$(aws ecs describe-express-gateway-service \
     --service-arn "${SERVICE_ARN}" --region "${REGION}" \
-    --query Service.Status --output text)
-  printf "  [%2d/%d] Status: %s\n" "${i}" "${ATTEMPTS}" "${STATUS}"
+    --query "service.status.statusCode" --output text 2>/dev/null || echo "UNKNOWN")
+  printf "  [%2d/%d] Service status: %s\n" "${i}" "${ATTEMPTS}" "${STATUS}"
   case "${STATUS}" in
-    RUNNING)          break ;;
-    CREATE_FAILED|\
-    UPDATE_FAILED|\
-    DELETE_FAILED)
-      err "Deployment failed (${STATUS})."
-      err "Check logs: App Runner console → ${SERVICE_NAME} → Logs"
-      exit 1 ;;
+    ACTIVE)   break ;;
+    FAILED|\
+    DELETING) err "Service failed to start (${STATUS}). Check ECS console."; exit 1 ;;
   esac
   sleep 10
 done
 
-if [ "${STATUS}" != "RUNNING" ]; then
-  err "Timed out waiting for RUNNING status. Last status: ${STATUS}"
-  err "Check the App Runner console for progress."
+if [ "${STATUS}" != "ACTIVE" ]; then
+  err "Timed out waiting for ACTIVE. Last status: ${STATUS}"
+  err "Check the ECS console for progress."
   exit 1
 fi
 
-# ── 13. get public URL and print summary ─────────────────────────────────────
-URL=$(aws apprunner describe-service \
+# ── 17. get the public URL ─────────────────────────────────────────────────────
+URL=$(aws ecs describe-express-gateway-service \
   --service-arn "${SERVICE_ARN}" --region "${REGION}" \
-  --query Service.ServiceUrl --output text)
+  --query "service.serviceRevisions[0].ingressPaths[?access=='PUBLIC'].endpoint | [0]" \
+  --output text 2>/dev/null || echo "")
+
+# Fallback: construct from service name (predictable pattern)
+if [ -z "${URL}" ] || [ "${URL}" = "None" ]; then
+  URL="https://${SERVICE_NAME}.ecs.${REGION}.on.aws"
+fi
+
+# Ensure https:// prefix
+[[ "${URL}" == https://* ]] || URL="https://${URL}"
+
+MCP_URL="${URL%/}/mcp"
 
 echo
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║   Deployment complete!                                        ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║                                                               ║"
-printf "║  MCP endpoint: %-47s║\n" "https://${URL}/mcp"
+printf "║  MCP endpoint:  %-46s║\n" "${MCP_URL}"
 echo "║                                                               ║"
 echo "║  Steps to register in CyberArk SAIA (Idira):                 ║"
 echo "║    1. Open SAIA → Register MCP server                         ║"
 echo "║    2. Paste the URL above into 'Server URL'                   ║"
 echo "║    3. Click Discover → Auth method should be 'None'           ║"
-echo "║    4. Fill in name/category and click Register                ║"
+echo "║    4. Fill in name / category and click Register              ║"
 echo "║                                                               ║"
-echo "║  Health check: https://${URL}/health"
+printf "║  Health check:  %-46s║\n" "${URL%/}/health"
 echo "║                                                               ║"
-echo "║  To redeploy after a code push (auto-deploy is ON):           ║"
-echo "║    git push origin main    ← App Runner detects & rebuilds    ║"
+echo "║  Future deployments: git push origin main                     ║"
+echo "║    → re-run  bash deploy.sh  to build & push new image        ║"
 echo "║                                                               ║"
-echo "║  To rotate the Deepgram API key, re-run: bash deploy.sh       ║"
+echo "║  To rotate the API key: re-run  bash deploy.sh                ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo

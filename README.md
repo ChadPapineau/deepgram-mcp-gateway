@@ -6,9 +6,9 @@ listing, and usage — so an AI agent can call them **through CyberArk Secure AI
 Agents (SAIA / Idira)**, with the CyberArk Identity Broker enforcing and auditing
 access.
 
-It speaks **Streamable HTTP** MCP and is deployed to **AWS App Runner** for a
-permanent, stable HTTPS endpoint that is compliant with corporate network security
-policies.
+It speaks **Streamable HTTP** MCP and is deployed to **Amazon ECS Express Mode**
+for a permanent, stable HTTPS endpoint that is compliant with corporate network
+security policies.
 
 ---
 
@@ -19,7 +19,7 @@ policies.
 - [Architecture](#architecture)
 - [Authentication model (why "None" in SAIA)](#authentication-model-why-none-in-saia)
 - [Prerequisites](#prerequisites)
-- [AWS App Runner deployment (recommended)](#aws-app-runner-deployment-recommended)
+- [AWS ECS Express Mode deployment (recommended)](#aws-ecs-express-mode-deployment-recommended)
 - [Local development (optional)](#local-development-optional)
 - [Registering the server in SAIA](#registering-the-server-in-saia)
 - [Testing with Claude](#testing-with-claude)
@@ -85,21 +85,21 @@ flowchart LR
       B["SAIA / Idira\nIdentity Broker\n(authN + authZ + audit)"]
     end
     subgraph AWS
-      R["App Runner\nhttps://xxxx.us-east-1.awsapprunner.com/mcp"]
+      E["ECS Express Mode\nhttps://deepgram-mcp-gateway.ecs.us-east-1.on.aws/mcp"]
       SM["Secrets Manager\nDEEPGRAM_API_KEY"]
     end
     D["Deepgram REST API\napi.deepgram.com/v1"]
 
     A -->|MCP over HTTPS| B
-    B -->|forwards to registered Server URL| R
-    R -->|reads secret at startup| SM
-    R -->|Authorization: Token API_KEY| D
+    B -->|forwards to registered Server URL| E
+    E -->|reads secret at startup| SM
+    E -->|Authorization: Token API_KEY| D
 ```
 
 Request flow: the agent talks to CyberArk; CyberArk authenticates, authorizes, and
 audits the request, then forwards the MCP call to the registered **Server URL** (the
-App Runner HTTPS endpoint); App Runner runs the MCP server which calls Deepgram's
-REST API using the API key injected from Secrets Manager.
+ECS Express Mode HTTPS endpoint); the container runs the MCP server which calls
+Deepgram's REST API using the API key injected from Secrets Manager.
 
 ## Why ngrok is required
 
@@ -144,39 +144,24 @@ otherwise-unauthenticated MCP server.**
 ## Prerequisites
 
 - A **Deepgram API key** — free at <https://console.deepgram.com>
-- An **AWS account** with permissions to use App Runner, IAM, and Secrets Manager
+- An **AWS account** with permissions to use ECS, ECR, CodeBuild, IAM, and Secrets Manager
 - AWS CLI configured (automatic in CloudShell; or `aws configure` locally)
+- No local Docker needed — CodeBuild builds the image in AWS
 
-## AWS App Runner deployment (recommended)
+## AWS ECS Express Mode deployment (recommended)
 
-AWS App Runner gives you a **permanent, stable HTTPS URL** with no servers to manage,
-no tunneling tools, and automatic TLS — the correct approach for any environment with
-corporate network security controls.
+Amazon ECS Express Mode gives you a **permanent HTTPS URL**, auto-provisioned
+Application Load Balancer, TLS certificate, autoscaling, and CloudWatch logging —
+all from a single `deploy.sh` run. No servers to manage, no tunnelling tools.
 
-### Step 1 — One-time: connect App Runner to GitHub
+> **Why ECS Express Mode?** AWS App Runner (the previous solution) stopped accepting
+> new customers in April 2026. ECS Express Mode is the AWS-recommended replacement
+> with the same "deploy a container, get an HTTPS URL" simplicity.
 
-This is done in the AWS Console (browser) and only needs to be done once.
+### One command from AWS CloudShell
 
-1. Open: **AWS Console → App Runner → GitHub connections**  
-   Direct link: `https://console.aws.amazon.com/apprunner/home#/github-connections`
-2. Click **Add new**, authorise GitHub when prompted, complete the setup
-3. Copy the **Connection ARN** — you will paste it into `deploy.sh`
-
-### Step 2 — Run the deployment script
-
-The script works from **AWS CloudShell** (no local setup needed) or from any
-machine with the AWS CLI configured.
-
-**From AWS CloudShell (recommended):**
-
-```bash
-# Open CloudShell from the AWS Console (the terminal icon in the top nav bar)
-git clone https://github.com/ChadPapineau/deepgram-mcp-gateway
-cd deepgram-mcp-gateway
-bash deploy.sh
-```
-
-**From a local terminal:**
+Open **AWS CloudShell** from the AWS Console (the terminal icon in the top navigation
+bar). Then:
 
 ```bash
 git clone https://github.com/ChadPapineau/deepgram-mcp-gateway
@@ -184,37 +169,45 @@ cd deepgram-mcp-gateway
 bash deploy.sh
 ```
 
-The script will prompt for:
+The script prompts for:
 
 | Prompt | What to enter |
 |--------|---------------|
-| AWS Region | e.g. `us-east-1` (or press Enter to use your configured default) |
+| AWS Region | e.g. `us-east-1` (or press Enter for your configured default) |
 | Service name | e.g. `deepgram-mcp-gateway` |
 | GitHub repo URL | `https://github.com/ChadPapineau/deepgram-mcp-gateway` |
 | Branch | `main` |
-| GitHub Connection ARN | Paste the ARN from Step 1 |
 | Deepgram API key | Your key — stored in Secrets Manager, never committed |
 
-When it finishes (~3 minutes) it prints:
+**What `deploy.sh` provisions automatically:**
+
+1. **ECR repository** — stores the Docker container image
+2. **CodeBuild project** — pulls from GitHub, runs `docker build`, pushes to ECR  
+   *(no local Docker required)*
+3. **Secrets Manager secret** — holds `DEEPGRAM_API_KEY` securely
+4. **Two IAM roles** — ECS task execution role and ECS infrastructure role
+5. **ECS Express Mode service** — Fargate container behind an ALB with auto-HTTPS
+
+When complete (~7–10 minutes total), it prints:
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
 ║   Deployment complete!                                        ║
 ║                                                               ║
-║  MCP endpoint: https://xxxx.us-east-1.awsapprunner.com/mcp   ║
+║  MCP endpoint:  https://deepgram-mcp-gateway.ecs.us-east-1.on.aws/mcp
 ║                                                               ║
 ║  Steps to register in CyberArk SAIA (Idira):                 ║
 ║    1. Open SAIA → Register MCP server                         ║
 ║    2. Paste the URL above into 'Server URL'                   ║
 ║    3. Click Discover → Auth method should be 'None'           ║
-║    4. Fill in name/category and click Register                ║
+║    4. Fill in name / category and click Register              ║
 ╚══════════════════════════════════════════════════════════════╝
 ```
 
 ### Redeploying after code changes
 
-Auto-deploy is enabled — any `git push origin main` automatically triggers a
-rebuild and redeploy on App Runner. No manual steps required.
+The image is not automatically rebuilt on `git push` — re-run `bash deploy.sh` any
+time you want a fresh image built from the latest commit.
 
 ### Rotating the Deepgram API key
 
@@ -225,12 +218,17 @@ Secrets Manager and triggers a fresh deployment.
 
 ```bash
 # Find the service ARN
-aws apprunner list-services --region YOUR_REGION \
-  --query "ServiceSummaryList[?ServiceName=='deepgram-mcp-gateway'].ServiceArn" \
-  --output text
+aws ecs list-services --cluster default --region YOUR_REGION \
+  --query "serviceArns[?contains(@,'deepgram-mcp-gateway')]" --output text
 
-# Delete it
-aws apprunner delete-service --service-arn YOUR_SERVICE_ARN --region YOUR_REGION
+# Delete the ECS service
+aws ecs delete-express-gateway-service --service-arn YOUR_SERVICE_ARN \
+  --region YOUR_REGION
+
+# Optionally clean up the ECR image and CodeBuild project
+aws ecr delete-repository --repository-name deepgram-mcp-gateway \
+  --force --region YOUR_REGION
+aws codebuild delete-project --name deepgram-mcp-gateway-build --region YOUR_REGION
 ```
 
 ---
@@ -363,29 +361,29 @@ network this is a harmless no-op.
 
 | Symptom | Cause / Fix |
 | ------- | ----------- |
-| Claude says "connector's server errored out" | The App Runner service may be paused or deploying. Check its status in the AWS Console → App Runner. |
-| `[Errno 2] No such file or directory` on tool calls (local dev) | Stale SSL context after machine sleep. Restart: `pkill -f deepgram_tools_mcp && ./venv/bin/python deepgram_tools_mcp.py`. |
-| `SSL: CERTIFICATE_VERIFY_FAILED ... self-signed certificate` (local dev) | Corporate TLS inspection proxy. Handled by `truststore`; ensure it's installed (`pip install -r requirements.txt`). |
-| App Runner health check failing | Confirm `/health` returns HTTP 200: `curl https://YOUR_URL/health` |
+| Claude says "connector's server errored out" | ECS service may be deploying or unhealthy. Check **ECS console → Clusters → default → Services → deepgram-mcp-gateway**. |
+| `deploy.sh` CodeBuild step fails | Check logs in **CodeBuild console → Projects → deepgram-mcp-gateway-build → Build history**. Common cause: repo URL typo or GitHub unauthenticated access to a private repo. |
+| Private GitHub repo — CodeBuild can't pull | Add a GitHub personal access token to Secrets Manager and configure it as a CodeBuild source credential. Contact the repo admin for access. |
+| ECS service stuck in `PENDING` / never `ACTIVE` | IAM role propagation can take 1–2 minutes. If it persists, check ECS task logs in CloudWatch Logs (`/ecs/deepgram-mcp-gateway`). |
+| Health check failing → tasks cycling | Confirm `/health` returns HTTP 200: `curl https://YOUR_URL/health`. |
+| `[Errno 2] No such file or directory` (local dev only) | Stale SSL context after machine sleep. Restart: `pkill -f deepgram_tools_mcp && ./venv/bin/python deepgram_tools_mcp.py`. |
+| `SSL: CERTIFICATE_VERIFY_FAILED` (local dev only) | Corporate TLS inspection proxy. Handled by `truststore`; ensure it's installed (`pip install -r requirements.txt`). |
 | `get_usage` returns `insufficient_permissions` | API key lacks `usage:read` scope. Create an Owner/Admin key in the Deepgram console, then re-run `deploy.sh`. |
-| `analyze_text` 400 "missing field `language`" | `language` is required by Deepgram's `/v1/read`; the server defaults to `en`. |
-| SAIA "discovery failed" on registration | Confirm the URL ends in `/mcp` and `curl https://YOUR_URL/mcp` returns HTTP 200. |
-| `deploy.sh` fails: "connection not found" or similar | The GitHub Connection ARN may be wrong or the connection is not in `AVAILABLE` status. Check App Runner → GitHub connections in the console. |
-| App Runner build fails (Python version) | App Runner uses `PYTHON_3` runtime (Python 3.12). Ensure `requirements.txt` has no version-pinned packages incompatible with 3.12. |
-| `AccessDenied` creating IAM role | Your AWS user/role needs `iam:CreateRole`, `iam:PutRolePolicy`, `iam:GetRole`. Ask your AWS admin to grant these. |
+| SAIA "discovery failed" on registration | Confirm the URL ends in `/mcp` and `curl -X POST https://YOUR_URL/mcp` returns HTTP 200. |
+| `AccessDenied` creating IAM roles in deploy.sh | Your AWS user needs `iam:CreateRole`, `iam:PutRolePolicy`, `iam:AttachRolePolicy`, `iam:GetRole`. Ask your AWS admin. |
 
 ## Repository layout
 
 ```
 .
-├── deepgram_tools_mcp.py          # The MCP server (5 tools, Streamable HTTP + /health)
-├── deploy.sh                      # Interactive AWS App Runner deployment script
-├── apprunner.yaml                 # App Runner build/run config (used by deploy.sh)
-├── Dockerfile                     # Container image (alternative/future ECR deployment)
+├── deepgram_tools_mcp.py          # MCP server (5 tools, Streamable HTTP + /health)
+├── deploy.sh                      # Interactive AWS ECS Express Mode deploy script
+├── buildspec.yml                  # CodeBuild spec: docker build + push to ECR
+├── Dockerfile                     # Container image definition
 ├── requirements.txt               # Python dependencies
 ├── run.sh                         # Local development launcher (not for production)
 ├── list_deepgram_mcp_tools.py     # Diagnostic: proves kapa endpoint is docs-only
-├── register-deepgram-oauth-client.sh  # (Optional) DCR helper for Deepgram's OAuth docs endpoint
+├── register-deepgram-oauth-client.sh  # (Optional) DCR helper for Deepgram OAuth docs endpoint
 ├── README.md
 ├── .gitignore
 ├── .env.example                   # Template — copy to .env for local dev
@@ -398,11 +396,13 @@ network this is a harmless no-op.
 
 - **Never commit `.env`** (it holds your Deepgram API key). It is git-ignored.
 - In the AWS deployment, the API key is stored in **Secrets Manager** — not in the
-  repo, not in App Runner environment config in plain text, and not in any log.
+  repo, not in plain-text ECS configuration, and not in any log.
 - The API key stays server-side; it is never sent to the agent or MCP client.
-- The App Runner HTTPS URL is unauthenticated at the MCP layer — access control is
-  enforced by CyberArk SAIA. Share the URL only through the SAIA registration; do
-  not paste it in public channels.
+- The ECS Express Mode HTTPS URL is unauthenticated at the MCP layer — access control
+  is enforced by CyberArk SAIA. Share the URL only through the SAIA registration;
+  do not paste it in public channels.
+- ECS Express Mode uses an internet-facing Application Load Balancer. All traffic
+  uses standard AWS-provided TLS (no tunnelling tool involved).
 - If a key is ever exposed, rotate it in the Deepgram console and re-run `deploy.sh`.
 
 ## Appendix: the Deepgram "docs MCP" red herring
