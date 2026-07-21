@@ -398,11 +398,31 @@ PYEOF
 step "Deploying ECS Express Mode service"
 echo "  ECS Express Mode auto-provisions an ALB, HTTPS cert, and stable URL."
 
-# Check if service already exists
+# Check if service exists in any state (including DRAINING after a manual delete)
 EXISTING_SERVICE_ARN=$(aws ecs list-services \
   --cluster default --region "${REGION}" \
   --query "serviceArns[?contains(@, '${SERVICE_NAME}')]" \
   --output text 2>/dev/null | head -1 || true)
+
+# If the service is still draining from a previous delete, wait for full removal
+if [ -n "${EXISTING_SERVICE_ARN}" ]; then
+  SVC_STATUS=$(aws ecs describe-express-gateway-service \
+    --service-arn "${EXISTING_SERVICE_ARN}" --region "${REGION}" \
+    --query "service.status.statusCode" --output text 2>/dev/null || echo "GONE")
+  if [[ "${SVC_STATUS}" == "DRAINING" || "${SVC_STATUS}" == "DELETING" ]]; then
+    warn "Service is still draining. Waiting up to 5 min for full removal..."
+    for i in $(seq 1 30); do
+      SVC_STATUS=$(aws ecs describe-express-gateway-service \
+        --service-arn "${EXISTING_SERVICE_ARN}" --region "${REGION}" \
+        --query "service.status.statusCode" --output text 2>/dev/null || echo "GONE")
+      printf "  [%2d/30] Status: %s\n" "${i}" "${SVC_STATUS}"
+      [[ "${SVC_STATUS}" == "GONE" || -z "${SVC_STATUS}" ]] && break
+      sleep 10
+    done
+    sleep 20
+    EXISTING_SERVICE_ARN=""
+  fi
+fi
 
 if [ -n "${EXISTING_SERVICE_ARN}" ]; then
   warn "Service '${SERVICE_NAME}' already exists — updating with new image..."
